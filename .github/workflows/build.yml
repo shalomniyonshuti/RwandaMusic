@@ -15,8 +15,6 @@ jobs:
       - name: Get the original zip from history
         id: unzip
         run: |
-          # The first uploaded zip (before any broken upload) is the good one.
-          FIRST=$(git rev-list --max-parents=0 HEAD | tail -1)
           FIRSTZIP=$(git log --diff-filter=A --format=%H --reverse -- 'RwandaMusic-Android-Project.zip' | head -1)
           git show "$FIRSTZIP:RwandaMusic-Android-Project.zip" > original.zip
           unzip -tq original.zip > /dev/null || { echo "::error::original zip is damaged"; exit 1; }
@@ -28,7 +26,6 @@ jobs:
       - name: Add background playback
         run: |
           cat > "$RUNNER_TEMP/patch.py" <<'PYEOF'
-
           import os, sys
           d = sys.argv[1]
           def rd(p): return open(os.path.join(d, p), encoding='utf-8').read()
@@ -54,6 +51,7 @@ jobs:
           import android.content.Intent;
           import android.content.pm.ServiceInfo;
           import android.media.AudioManager;
+          import android.net.wifi.WifiManager;
           import android.os.Build;
           import android.os.Handler;
           import android.os.IBinder;
@@ -64,20 +62,20 @@ jobs:
           import androidx.core.app.ServiceCompat;
 
           /**
-           * Keeps the app process alive (and shows a "playing" notification) while music plays
-           * after the app is minimised or the screen is turned off. It stops by itself when the
-           * audio has stopped for a while, when the user reopens the app, or when the app is
-           * swiped away from the recent apps list.
+           * Keeps the app alive (notification + CPU and Wi-Fi locks) while music plays after the
+           * app is minimised or the screen is off. It stops by itself after 60 seconds of silence,
+           * when the app is reopened, or when the app is swiped away from recent apps.
            */
           public class PlaybackService extends Service {
 
               private static final String CHANNEL_ID = "playback";
               private static final int NOTIFICATION_ID = 1;
               private static final long CHECK_EVERY_MS = 5000;
-              private static final int SILENT_CHECKS_BEFORE_STOP = 6;   // 6 x 5 s = 30 s of silence
+              private static final int SILENT_CHECKS_BEFORE_STOP = 12;   // 12 x 5 s = 60 s of silence
 
               private final Handler handler = new Handler(Looper.getMainLooper());
               private PowerManager.WakeLock wakeLock;
+              private WifiManager.WifiLock wifiLock;
               private int silentChecks = 0;
 
               private final Runnable checkAudio = new Runnable() {
@@ -106,6 +104,14 @@ jobs:
                       wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RwandaMusic:playback");
                       wakeLock.setReferenceCounted(false);
                   }
+                  WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                  if (wm != null) {
+                      int mode = Build.VERSION.SDK_INT >= 29
+                              ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                              : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                      wifiLock = wm.createWifiLock(mode, "RwandaMusic:wifi");
+                      wifiLock.setReferenceCounted(false);
+                  }
               }
 
               @Override
@@ -131,6 +137,7 @@ jobs:
                   ServiceCompat.startForeground(this, NOTIFICATION_ID, n, type);
 
                   if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L);
+                  if (wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
 
                   silentChecks = 0;
                   handler.removeCallbacks(checkAudio);
@@ -149,6 +156,7 @@ jobs:
               public void onDestroy() {
                   handler.removeCallbacksAndMessages(null);
                   if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
                   super.onDestroy();
               }
 
@@ -185,43 +193,76 @@ jobs:
           ''')
 
           m = rd('app/src/main/AndroidManifest.xml')
+          perms = ('FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'POST_NOTIFICATIONS',
+                   'WAKE_LOCK', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS')
           m = rep(m, '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n',
            '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n'
-           '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
-           '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n'
-           '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
-           '    <uses-permission android:name="android.permission.WAKE_LOCK" />\n')
+           + ''.join('    <uses-permission android:name="android.permission.%s" />\n' % p for p in perms))
           m = rep(m, '        </activity>\n    </application>',
            '        </activity>\n\n        <service\n            android:name=".PlaybackService"\n'
            '            android:exported="false"\n            android:foregroundServiceType="mediaPlayback" />\n    </application>')
           wr('app/src/main/AndroidManifest.xml', m)
 
           a = rd(JAVA + 'MainActivity.java')
-          a = rep(a, 'import android.content.Intent;\n', 'import android.content.Context;\nimport android.content.Intent;\nimport android.content.pm.PackageManager;\nimport android.media.AudioManager;\nimport android.os.Build;\n')
+          a = rep(a, 'import android.content.Intent;\n', 'import android.content.Context;\nimport android.content.Intent;\nimport android.content.SharedPreferences;\nimport android.content.pm.PackageManager;\nimport android.os.Build;\nimport android.os.PowerManager;\nimport android.provider.Settings;\n')
           a = rep(a, 'import androidx.core.graphics.Insets;', 'import androidx.core.app.ActivityCompat;\nimport androidx.core.content.ContextCompat;\nimport androidx.core.graphics.Insets;')
           a = rep(a, '    private static final String YT_SCOPE = "https://www.googleapis.com/auth/youtube";\n',
            '    private static final String YT_SCOPE = "https://www.googleapis.com/auth/youtube";\n\n'
            '    /** true = music keeps playing when the app is minimised or the screen is off. */\n'
            '    private static final boolean BACKGROUND_PLAYBACK = true;\n')
+          a = rep(a, '        web = new WebView(this);', '        web = new BgWebView(this);')
           a = rep(a, '        createWebView();\n\n        if (savedInstanceState',
            '        createWebView();\n\n'
-           '        if (Build.VERSION.SDK_INT >= 33\n'
-           '                && ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS")\n'
-           '                != PackageManager.PERMISSION_GRANTED) {\n'
-           '            ActivityCompat.requestPermissions(this,\n'
-           '                    new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);\n'
+           '        if (BACKGROUND_PLAYBACK) {\n'
+           '            if (Build.VERSION.SDK_INT >= 33\n'
+           '                    && ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS")\n'
+           '                    != PackageManager.PERMISSION_GRANTED) {\n'
+           '                ActivityCompat.requestPermissions(this,\n'
+           '                        new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);\n'
+           '            } else {\n'
+           '                root.post(this::askBatteryOptimization);\n'
+           '            }\n'
            '        }\n\n'
            '        if (savedInstanceState')
           i = a.index('    @Override\n    protected void onPause()')
           j = a.index('    @Override\n    protected void onSaveInstanceState')
-          a = a[:i] + r'''    private boolean isMusicPlaying() {
-                  AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-                  return am != null && am.isMusicActive();
+          k = a.index('    // --------------------------------------------------------------- lifecycle')
+          a = a[:k] + r'''    // ------------------------------------------------- background playback
+
+              /** WebView that is never told it is hidden, so audio keeps playing with the screen off. */
+              private static class BgWebView extends WebView {
+                  BgWebView(Context c) { super(c); }
+
+                  @Override
+                  protected void onWindowVisibilityChanged(int visibility) {
+                      if (visibility != View.GONE) super.onWindowVisibilityChanged(View.VISIBLE);
+                  }
+              }
+
+              private void askBatteryOptimization() {
+                  try {
+                      PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                      SharedPreferences sp = getSharedPreferences("rm", MODE_PRIVATE);
+                      if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())
+                              || sp.getBoolean("askedBattery", false)) return;
+                      sp.edit().putBoolean("askedBattery", true).apply();
+                      startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                              Uri.parse("package:" + getPackageName())));
+                  } catch (RuntimeException ignored) {
+                  }
               }
 
               @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (BACKGROUND_PLAYBACK && root != null) root.post(this::askBatteryOptimization);
+              }
+
+          ''' + a[k:i] + r'''    @Override
               protected void onPause() {
-                  if (BACKGROUND_PLAYBACK && isMusicPlaying()) {
+                  if (BACKGROUND_PLAYBACK) {
+                      // Keep the page running and start the foreground service so Android
+                      // does not stop the app while the screen is off.
                       try {
                           ContextCompat.startForegroundService(this, new Intent(this, PlaybackService.class));
                       } catch (RuntimeException ignored) {
