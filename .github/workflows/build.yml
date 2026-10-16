@@ -9,14 +9,246 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Unzip project
+      - name: Get the original zip from history
         id: unzip
         run: |
+          # The first uploaded zip (before any broken upload) is the good one.
+          FIRST=$(git rev-list --max-parents=0 HEAD | tail -1)
+          FIRSTZIP=$(git log --diff-filter=A --format=%H --reverse -- 'RwandaMusic-Android-Project.zip' | head -1)
+          git show "$FIRSTZIP:RwandaMusic-Android-Project.zip" > original.zip
+          unzip -tq original.zip > /dev/null || { echo "::error::original zip is damaged"; exit 1; }
           mkdir work
-          unzip -q ./*.zip -d work
+          unzip -q original.zip -d work
           DIR=$(dirname "$(find work -name settings.gradle | head -1)")
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Add background playback
+        run: |
+          cat > "$RUNNER_TEMP/patch.py" <<'PYEOF'
+
+          import os, sys
+          d = sys.argv[1]
+          def rd(p): return open(os.path.join(d, p), encoding='utf-8').read()
+          def wr(p, s):
+              f = os.path.join(d, p); os.makedirs(os.path.dirname(f), exist_ok=True)
+              open(f, 'w', encoding='utf-8').write(s)
+          def rep(s, old, new):
+              assert old in s, 'patch target not found: ' + old[:50]
+              return s.replace(old, new, 1)
+
+          JAVA = 'app/src/main/java/store/rwandamusic/app/'
+          if os.path.exists(os.path.join(d, JAVA + 'PlaybackService.java')):
+              print('Already patched, nothing to do'); sys.exit(0)
+
+          wr(JAVA + 'PlaybackService.java', r'''package store.rwandamusic.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.media.AudioManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.PowerManager;
+
+          import androidx.core.app.NotificationCompat;
+          import androidx.core.app.ServiceCompat;
+
+          /**
+           * Keeps the app process alive (and shows a "playing" notification) while music plays
+           * after the app is minimised or the screen is turned off. It stops by itself when the
+           * audio has stopped for a while, when the user reopens the app, or when the app is
+           * swiped away from the recent apps list.
+           */
+          public class PlaybackService extends Service {
+
+              private static final String CHANNEL_ID = "playback";
+              private static final int NOTIFICATION_ID = 1;
+              private static final long CHECK_EVERY_MS = 5000;
+              private static final int SILENT_CHECKS_BEFORE_STOP = 6;   // 6 x 5 s = 30 s of silence
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private PowerManager.WakeLock wakeLock;
+              private int silentChecks = 0;
+
+              private final Runnable checkAudio = new Runnable() {
+                  @Override
+                  public void run() {
+                      AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                      if (am != null && am.isMusicActive()) {
+                          silentChecks = 0;
+                      } else {
+                          silentChecks++;
+                      }
+                      if (silentChecks >= SILENT_CHECKS_BEFORE_STOP) {
+                          stopSelf();
+                      } else {
+                          handler.postDelayed(this, CHECK_EVERY_MS);
+                      }
+                  }
+              };
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  createChannel();
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  if (pm != null) {
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RwandaMusic:playback");
+                      wakeLock.setReferenceCounted(false);
+                  }
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  Intent open = new Intent(this, MainActivity.class)
+                          .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+                  Notification n = new NotificationCompat.Builder(this, CHANNEL_ID)
+                          .setSmallIcon(R.drawable.ic_stat_music)
+                          .setContentTitle(getString(R.string.app_name))
+                          .setContentText(getString(R.string.playing_in_background))
+                          .setContentIntent(pi)
+                          .setOngoing(true)
+                          .setOnlyAlertOnce(true)
+                          .setSilent(true)
+                          .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+                          .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                          .build();
+
+                  int type = Build.VERSION.SDK_INT >= 29 ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK : 0;
+                  ServiceCompat.startForeground(this, NOTIFICATION_ID, n, type);
+
+                  if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L);
+
+                  silentChecks = 0;
+                  handler.removeCallbacks(checkAudio);
+                  handler.postDelayed(checkAudio, CHECK_EVERY_MS);
+                  return START_NOT_STICKY;
+              }
+
+              @Override
+              public void onTaskRemoved(Intent rootIntent) {
+                  // App swiped away from recents: stop everything.
+                  stopSelf();
+                  super.onTaskRemoved(rootIntent);
+              }
+
+              @Override
+              public void onDestroy() {
+                  handler.removeCallbacksAndMessages(null);
+                  if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              private void createChannel() {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  NotificationChannel ch = new NotificationChannel(CHANNEL_ID,
+                          getString(R.string.playback_channel), NotificationManager.IMPORTANCE_LOW);
+                  ch.setShowBadge(false);
+                  nm.createNotificationChannel(ch);
+              }
+          }
+          ''')
+          wr('app/src/main/res/drawable/ic_stat_music.xml', r'''<vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,3v10.55c-0.59,-0.34 -1.27,-0.55 -2,-0.55 -2.21,0 -4,1.79 -4,4s1.79,4 4,4 4,-1.79 4,-4V7h4V3h-6z" />
+          </vector>
+          ''')
+          wr('app/src/main/res/values/strings.xml', r'''<resources>
+              <string name="app_name">Rwanda Music</string>
+              <string name="playback_channel">Music playback</string>
+              <string name="playing_in_background">Playing music. Tap to open.</string>
+          </resources>
+          ''')
+
+          m = rd('app/src/main/AndroidManifest.xml')
+          m = rep(m, '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n',
+           '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n'
+           '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+           '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n'
+           '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+           '    <uses-permission android:name="android.permission.WAKE_LOCK" />\n')
+          m = rep(m, '        </activity>\n    </application>',
+           '        </activity>\n\n        <service\n            android:name=".PlaybackService"\n'
+           '            android:exported="false"\n            android:foregroundServiceType="mediaPlayback" />\n    </application>')
+          wr('app/src/main/AndroidManifest.xml', m)
+
+          a = rd(JAVA + 'MainActivity.java')
+          a = rep(a, 'import android.content.Intent;\n', 'import android.content.Context;\nimport android.content.Intent;\nimport android.content.pm.PackageManager;\nimport android.media.AudioManager;\nimport android.os.Build;\n')
+          a = rep(a, 'import androidx.core.graphics.Insets;', 'import androidx.core.app.ActivityCompat;\nimport androidx.core.content.ContextCompat;\nimport androidx.core.graphics.Insets;')
+          a = rep(a, '    private static final String YT_SCOPE = "https://www.googleapis.com/auth/youtube";\n',
+           '    private static final String YT_SCOPE = "https://www.googleapis.com/auth/youtube";\n\n'
+           '    /** true = music keeps playing when the app is minimised or the screen is off. */\n'
+           '    private static final boolean BACKGROUND_PLAYBACK = true;\n')
+          a = rep(a, '        createWebView();\n\n        if (savedInstanceState',
+           '        createWebView();\n\n'
+           '        if (Build.VERSION.SDK_INT >= 33\n'
+           '                && ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS")\n'
+           '                != PackageManager.PERMISSION_GRANTED) {\n'
+           '            ActivityCompat.requestPermissions(this,\n'
+           '                    new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);\n'
+           '        }\n\n'
+           '        if (savedInstanceState')
+          i = a.index('    @Override\n    protected void onPause()')
+          j = a.index('    @Override\n    protected void onSaveInstanceState')
+          a = a[:i] + r'''    private boolean isMusicPlaying() {
+                  AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                  return am != null && am.isMusicActive();
+              }
+
+              @Override
+              protected void onPause() {
+                  if (BACKGROUND_PLAYBACK && isMusicPlaying()) {
+                      try {
+                          ContextCompat.startForegroundService(this, new Intent(this, PlaybackService.class));
+                      } catch (RuntimeException ignored) {
+                      }
+                  } else if (web != null) {
+                      web.evaluateJavascript("(function(){var f=document.querySelector('iframe');"
+                              + "if(f&&f.contentWindow)f.contentWindow.postMessage(JSON.stringify("
+                              + "{event:'command',func:'pauseVideo',args:[]}),'*');})()", null);
+                      web.onPause();
+                  }
+                  super.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  stopService(new Intent(this, PlaybackService.class));
+                  if (web != null) web.onResume();
+              }
+
+          ''' + a[j:]
+          a = rep(a, '    protected void onDestroy() {\n        if (web != null) {',
+           '    protected void onDestroy() {\n        if (isFinishing()) stopService(new Intent(this, PlaybackService.class));\n        if (web != null) {')
+          wr(JAVA + 'MainActivity.java', a)
+          print('Background playback patch applied')
+          PYEOF
+          python3 "$RUNNER_TEMP/patch.py" "${{ steps.unzip.outputs.dir }}"
 
       - uses: actions/setup-java@v4
         with:
